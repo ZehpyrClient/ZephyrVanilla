@@ -1,0 +1,835 @@
+package com.zephyr.client.configplusgui.screen;
+
+import com.zephyr.client.configplusgui.keybind.GlfwKeyNames;
+import com.zephyr.client.configplusgui.keybind.Keybind;
+import com.zephyr.client.configplusgui.keybind.KeybindManager;
+import com.zephyr.client.configplusgui.module.Category;
+import com.zephyr.client.configplusgui.module.HiddenModules;
+import com.zephyr.client.configplusgui.module.Module;
+import com.zephyr.client.configplusgui.module.ModuleManager;
+import com.zephyr.client.configplusgui.setting.BooleanSetting;
+import com.zephyr.client.configplusgui.setting.ClickableSetting;
+import com.zephyr.client.configplusgui.setting.EnumSetting;
+import com.zephyr.client.configplusgui.setting.KeybindSetting;
+import com.zephyr.client.configplusgui.setting.ListSetting;
+import com.zephyr.client.configplusgui.setting.NumberSetting;
+import com.zephyr.client.configplusgui.setting.Setting;
+import com.zephyr.client.configplusgui.setting.StringSetting;
+import com.mojang.blaze3d.platform.InputConstants;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.input.CharacterEvent;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.network.chat.Component;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Lunar-esque click-gui: a blurred, scrollable, searchable list of every registered
+ * {@link Module}. Left-click a row to toggle it, right click to expand its settings.
+ * Opened/closed via the "Open Menu" keybind (L + Enter by default, see
+ * {@link KeybindManager}), and reachable from the other two Zephyr screens with the
+ * "Cycle Screen" keybind (Tab by default).
+ */
+@SuppressWarnings ("all")
+public final class ClickGuiScreen extends ZephyrScreen {
+    private static final int TAB_HEIGHT = 18;
+    private static final int SEARCH_HEIGHT = 20;
+    private static final int ROW_HEIGHT = 26;
+    private static final int SETTING_ROW_HEIGHT = 20;
+    private static final int LIST_ICON_SIZE = 10;
+    private static final int CONFLICT_RED = 0xFFE05B5B;
+
+    private final List<Module> modules = new ArrayList<>(ModuleManager.getVisibleModules());
+    private String searchQuery = "";
+    private EditBox searchBox;
+
+    private Category selectedCategory = null; // null == "All"
+    private boolean categoryDropdownOpen = false;
+    private static final int DROPDOWN_OPTION_HEIGHT = 18;
+    /** Opaque version of {@link ZephyrScreen#PANEL_BG}, used behind the category popup. */
+    private static final int DROPDOWN_BG = PANEL_BG | 0xFF000000;
+    private double scrollOffset = 0;
+    private Module expandedModule = null;
+    private NumberSetting draggingSetting = null;
+
+    /** List setting whose "add entry" row is currently open, plus its two text inputs. */
+    private ListSetting listEditing = null;
+    private EditBox blockInputBox;
+    private EditBox colorInputBox;
+
+    /** String setting being edited inline, plus its text input. */
+    private StringSetting stringEditing = null;
+    private EditBox stringInputBox;
+
+    /** Keybind setting currently recording a new combo, plus the in-progress capture state. */
+    private KeybindSetting capturingKeybind = null;
+    private final LinkedHashSet<Integer> captureBuffer = new LinkedHashSet<>();
+    private final Set<Integer> currentlyHeld = new java.util.HashSet<>();
+
+    /** Opens the click-gui without a slide animation (fresh open via the menu keybind). */
+    public ClickGuiScreen() {
+        this(0, false);
+    }
+
+    /** Creates the screen with the given entry slide; package-visible for {@link ZephyrScreen.Nav}. */
+    ClickGuiScreen(int enterDirection, boolean slideVertically) {
+        super(Component.literal("Zephyr"), enterDirection, slideVertically);
+    }
+
+    @Override
+    protected Nav currentNav() {
+        return Nav.MAIN;
+    }
+
+    @Override
+    protected int headerHeight() {
+        return TITLE_HEIGHT + TAB_HEIGHT + SEARCH_HEIGHT;
+    }
+
+    /** Creates the module search box and keeps it in sync with the panel during slides. */
+    @Override
+    protected void initWidgets() {
+        int searchY = panelY + TITLE_HEIGHT + TAB_HEIGHT + 2;
+        searchBox = new EditBox(this.font, panelX + PADDING, searchY, panelWidth - PADDING * 2, 16,
+                Component.literal("Search"));
+        searchBox.setHint(Component.literal("Search modules..."));
+        searchBox.setBordered(false);
+        searchBox.setResponder(query -> {
+            this.searchQuery = query;
+            this.scrollOffset = 0;
+            this.categoryDropdownOpen = false;
+            clearListEditing();
+            closeStringEditing(true);
+        });
+        this.addRenderableWidget(searchBox);
+    }
+
+    /** Renders the whole screen: chrome, tab bar, scrolled/filtered module list and scroll bar. */
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
+        withPanelSlide(() -> {
+            // The search box's x/y were fixed at init() time; keep it tracking the
+            // panel while a slide-cycle animation is temporarily offsetting panelX.
+            searchBox.setX(panelX + PADDING);
+            searchBox.setY(panelY + TITLE_HEIGHT + TAB_HEIGHT + 2);
+
+            renderChrome(graphics, mouseX, mouseY);
+            renderCategoryButton(graphics, mouseX, mouseY);
+
+            int listTop = panelY + headerHeight();
+            int listBottom = panelY + panelHeight - PADDING;
+
+            List<RowLayout> layout = computeLayout(listTop);
+            int contentHeight = layout.isEmpty() ? 0
+                    : (layout.get(layout.size() - 1).bottom() - listTop);
+            int maxScroll = Math.max(0, contentHeight - (listBottom - listTop));
+            scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+
+            // If the string editor's row vanished (module collapsed, filtered out),
+            // commit and close so no orphaned input box lingers on screen.
+            if (stringEditing != null && layout.stream().flatMap(row -> row.settingRows().stream())
+                    .noneMatch(settingRow -> settingRow.setting() == stringEditing)) {
+                closeStringEditing(true);
+            }
+
+            graphics.enableScissor(panelX, listTop, panelX + panelWidth, listBottom);
+            for (RowLayout row : layout) {
+                renderRow(graphics, row, mouseX, mouseY, (int) scrollOffset);
+            }
+            graphics.disableScissor();
+
+            if (layout.isEmpty()) {
+                graphics.centeredText(this.font, "No modules found", panelX + panelWidth / 2,
+                        listTop + 20, TEXT_DIM);
+            }
+
+            if (maxScroll > 0) {
+                int trackHeight = listBottom - listTop;
+                int barHeight = Math.max(20, trackHeight * trackHeight / (trackHeight + maxScroll));
+                int barY = listTop + (int) ((trackHeight - barHeight) * (scrollOffset / (double) maxScroll));
+                graphics.fill(panelX + panelWidth - 4, barY, panelX + panelWidth - 1, barY + barHeight, accentDim());
+            }
+
+            super.extractRenderState(graphics, mouseX, mouseY, partialTick);
+
+            // Drawn last so the popup sits above the translucent module list
+            // and header widgets (e.g. the search box) instead of under them.
+            renderCategoryPopup(graphics, mouseX, mouseY);
+        });
+    }
+
+    /**
+     * Draws the single category filter button ("Category: All/Bot/..."). A new
+     * {@link Category} only adds one row to the dropdown popup instead of one more
+     * cramped tab, so the header stays one row no matter how many types exist.
+     */
+    private void renderCategoryButton(GuiGraphicsExtractor graphics, int mouseX, int mouseY) {
+        int buttonTop = panelY + TITLE_HEIGHT;
+        int buttonBottom = buttonTop + TAB_HEIGHT - 2;
+        int left = panelX + PADDING;
+        int right = panelX + panelWidth - PADDING;
+
+        boolean hovered = !categoryDropdownOpen && mouseX >= left && mouseX < right
+                && mouseY >= buttonTop && mouseY < buttonBottom;
+        graphics.fill(left, buttonTop, right, buttonBottom, categoryDropdownOpen ? accent() : (hovered ? ROW_BG_HOVER : TAB_BG));
+
+        String label = "Category: " + (selectedCategory == null ? "All" : selectedCategory.getDisplayName());
+        int textColor = categoryDropdownOpen ? TEXT_ON_ACCENT : TEXT_DIM;
+        graphics.text(this.font, label, left + 8, buttonTop + 4, textColor, false);
+
+        String arrow = categoryDropdownOpen ? "▲" : "▼";
+        int arrowWidth = this.font.width(arrow);
+        graphics.text(this.font, arrow, right - arrowWidth - 8, buttonTop + 4, textColor, false);
+    }
+
+    /**
+     * Draws the open category popup on top of the list (no scissor), with one row
+     * per filter option. Rendered after the list so it overlaps it cleanly.
+     */
+    private void renderCategoryPopup(GuiGraphicsExtractor graphics, int mouseX, int mouseY) {
+        if (!categoryDropdownOpen) return;
+        int buttonBottom = panelY + TITLE_HEIGHT + TAB_HEIGHT - 2;
+        int left = panelX + PADDING;
+        int right = panelX + panelWidth - PADDING;
+        int popupTop = buttonBottom + 2;
+
+        List<Category> categories = visibleCategories();
+        int popupHeight = (categories.size() + 1) * DROPDOWN_OPTION_HEIGHT;
+        // Opaque backdrop: both the popup rows and the module list are
+        // translucent, so without this the list bleeds through the popup.
+        graphics.fill(left, popupTop, right, popupTop + popupHeight, DROPDOWN_BG);
+        for (int i = 0; i <= categories.size(); i++) {
+            Category option = i == 0 ? null : categories.get(i - 1);
+            int optionTop = popupTop + i * DROPDOWN_OPTION_HEIGHT;
+            int optionBottom = optionTop + DROPDOWN_OPTION_HEIGHT;
+            boolean isSelected = option == selectedCategory;
+            boolean hovered = !isSelected && mouseX >= left && mouseX < right
+                    && mouseY >= optionTop && mouseY < optionBottom;
+
+            graphics.fill(left, optionTop, right, optionBottom, isSelected ? accent() : (hovered ? ROW_BG_HOVER : ROW_BG));
+            String optionLabel = option == null ? "All" : option.getDisplayName();
+            int textColor = isSelected ? TEXT_ON_ACCENT : TEXT_MAIN;
+            graphics.text(this.font, optionLabel, left + 8, optionTop + 5, textColor, false);
+        }
+    }
+
+    /** Every selectable category filter, in enum order, excluding hidden ones unless unlocked. */
+    private List<Category> visibleCategories() {
+        List<Category> visible = new ArrayList<>();
+        for (Category c : Category.values()) {
+            if (c == Category.HIDDEN && !HiddenModules.shouldShowHidden()) continue;
+            visible.add(c);
+        }
+        return visible;
+    }
+
+    /** Draws one module row (name, category tag, hover/disabled background) and its expanded settings. */
+    private void renderRow(GuiGraphicsExtractor graphics, RowLayout row, int mouseX, int mouseY, int scroll) {
+        int top = row.top - scroll;
+        boolean hovered = mouseX >= panelX + PADDING && mouseX <= panelX + panelWidth - PADDING
+                && mouseY >= top && mouseY < top + ROW_HEIGHT;
+
+        int bg = row.module.isEnabled() ? rowBgEnabled() : (hovered ? ROW_BG_HOVER : ROW_BG);
+        graphics.fill(panelX + PADDING, top, panelX + panelWidth - PADDING, top + ROW_HEIGHT, bg);
+
+        int nameColor = row.module.isEnabled() ? accent() : TEXT_MAIN;
+        graphics.text(this.font, row.module.getName(), panelX + PADDING + 8, top + 9, nameColor, false);
+
+        String tag = row.module.getCategory().getDisplayName();
+        int tagWidth = this.font.width(tag);
+        graphics.text(this.font, tag, panelX + panelWidth - PADDING - tagWidth - 8, top + 9, TEXT_DIM, false);
+
+        if (row.expanded) {
+            int settingTop = top + ROW_HEIGHT + 2;
+            for (SettingRowLayout settingRow : row.settingRows) {
+                renderSetting(graphics, settingRow, settingTop);
+                settingTop += settingRow.height();
+            }
+        }
+    }
+
+    /** Draws a single setting row: checkbox for booleans, slider for numbers, value for enums, combo for keybinds, list UI otherwise. */
+    private void renderSetting(GuiGraphicsExtractor graphics, SettingRowLayout settingRow, int top) {
+        int left = panelX + PADDING + 8;
+        int right = panelX + panelWidth - PADDING - 8;
+
+        if (settingRow.setting instanceof BooleanSetting boolSetting) {
+            graphics.text(this.font, settingRow.setting.getName(), left, top + 6, TEXT_DIM, false);
+            int boxSize = 10;
+            int boxX = right - boxSize;
+            graphics.fill(boxX, top + 5, boxX + boxSize, top + 5 + boxSize,
+                    boolSetting.get() ? accent() : 0x40FFFFFF);
+        } else if (settingRow.setting instanceof NumberSetting numberSetting) {
+            String label = settingRow.setting.getName() + ": " + trimDouble(numberSetting.get());
+            graphics.text(this.font, label, left, top, TEXT_DIM, false);
+
+            int trackY = top + 12;
+            graphics.fill(left, trackY, right, trackY + 2, 0x40FFFFFF);
+            int fillWidth = (int) ((right - left) * numberSetting.getProgress());
+            graphics.fill(left, trackY, left + fillWidth, trackY + 2, accent());
+            graphics.fill(left + fillWidth - 1, trackY - 2, left + fillWidth + 1, trackY + 4, accent());
+        } else if (settingRow.setting instanceof EnumSetting<?> enumSetting) {
+            graphics.text(this.font, settingRow.setting.getName(), left, top + 6, TEXT_DIM, false);
+
+            String value = enumSetting.getDisplayValue();
+            int valueWidth = this.font.width(value);
+            graphics.text(this.font, value, right - valueWidth, top + 6, accent(), false);
+        } else if (settingRow.setting instanceof KeybindSetting keybindSetting) {
+            graphics.text(this.font, settingRow.setting.getName(), left, top + 6, TEXT_DIM, false);
+
+            Keybind bind = keybindSetting.get() == null ? Keybind.NONE : keybindSetting.get();
+            boolean capturing = keybindSetting == capturingKeybind;
+            String value = capturing ? captureLabel() : bind.getLabel();
+            int valueWidth = this.font.width(value);
+            int valueColor = capturing ? accent()
+                    : (bind.conflicted() ? CONFLICT_RED : (bind.isSet() ? accent() : TEXT_DIM));
+            graphics.text(this.font, value, right - valueWidth, top + 6, valueColor, false);
+        } else if (settingRow.setting instanceof StringSetting stringSetting) {
+            graphics.text(this.font, settingRow.setting.getName(), left, top + 6, TEXT_DIM, false);
+            if (stringEditing == stringSetting && stringInputBox != null) {
+                // Editing: the label row stays, and an inline input row appears below it.
+                graphics.fill(panelX + PADDING, top + SETTING_ROW_HEIGHT,
+                        panelX + panelWidth - PADDING, top + SETTING_ROW_HEIGHT * 2, ROW_BG_HOVER);
+                stringInputBox.setX(left);
+                stringInputBox.setY(top + SETTING_ROW_HEIGHT + 4);
+                stringInputBox.setWidth(right - left);
+            } else {
+                String value = stringSetting.get();
+                if (!value.isEmpty()) {
+                    int valueWidth = this.font.width(value);
+                    graphics.text(this.font, value, right - valueWidth, top + 6, accent(), false);
+                }
+            }
+        } else if (settingRow.setting instanceof ListSetting listSetting) {
+            renderListSetting(graphics, listSetting, top, left, right);
+        } else if (settingRow.setting instanceof ClickableSetting clickableSetting) {
+            graphics.text(this.font, settingRow.setting.getName(), left, top + 6, TEXT_DIM, false);
+            String value = clickableSetting.getDisplayValue();
+            if (!value.isEmpty()) {
+                int valueWidth = this.font.width(value);
+                graphics.text(this.font, value, right - valueWidth, top + 6, accent(), false);
+            }
+        }
+    }
+
+    /** Draws a {@link ListSetting}: header with an "add" icon, one row per entry (swatch, name, remove icon). */
+    private void renderListSetting(GuiGraphicsExtractor graphics, ListSetting setting, int top, int left, int right) {
+        graphics.fill(panelX + PADDING, top, panelX + panelWidth - PADDING, top + SETTING_ROW_HEIGHT, ROW_BG_HOVER);
+        graphics.text(this.font, setting.getName(), left, top + 6, TEXT_DIM, false);
+
+        int addX = right - LIST_ICON_SIZE;
+        int addY = top + (SETTING_ROW_HEIGHT - LIST_ICON_SIZE) / 2;
+        graphics.fill(addX, addY, addX + LIST_ICON_SIZE, addY + LIST_ICON_SIZE, accent());
+        drawPlus(graphics, addX, addY, TEXT_ON_ACCENT);
+
+        int entryTop = top + SETTING_ROW_HEIGHT;
+        for (ListSetting.ListEntry entry : setting.get()) {
+            graphics.fill(panelX + PADDING, entryTop, panelX + panelWidth - PADDING, entryTop + SETTING_ROW_HEIGHT, ROW_BG);
+
+            int swatchX = left;
+            int swatchY = entryTop + (SETTING_ROW_HEIGHT - 8) / 2;
+            graphics.fill(swatchX, swatchY, swatchX + 8, swatchY + 8, ListSetting.parseColor(entry.color(), 0xFFFFFFFF));
+
+            graphics.text(this.font, entry.blockName(), left + 14, entryTop + 6, TEXT_MAIN, false);
+
+            int removeX = right - LIST_ICON_SIZE;
+            int removeY = entryTop + (SETTING_ROW_HEIGHT - LIST_ICON_SIZE) / 2;
+            graphics.fill(removeX, removeY, removeX + LIST_ICON_SIZE, removeY + LIST_ICON_SIZE, 0xFFE05B5B);
+            graphics.centeredText(this.font, "x", removeX + LIST_ICON_SIZE / 2, removeY, TEXT_DIM);
+
+            entryTop += SETTING_ROW_HEIGHT;
+        }
+
+        if (listEditing == setting) {
+            renderListInputRow(graphics, setting, entryTop, left, right);
+        }
+    }
+
+    /** Draws the inline block-id/color inputs and commit icon shown while adding a list entry. */
+    private void renderListInputRow(GuiGraphicsExtractor graphics, ListSetting setting, int top, int left, int right) {
+        graphics.fill(panelX + PADDING, top, panelX + panelWidth - PADDING, top + SETTING_ROW_HEIGHT, ROW_BG_HOVER);
+
+        int blockWidth = 90;
+        int colorWidth = 60;
+        int gap = 4;
+        int commitX = right - LIST_ICON_SIZE;
+
+        blockInputBox.setX(left);
+        blockInputBox.setY(top + 4);
+        blockInputBox.setWidth(blockWidth);
+        colorInputBox.setX(left + blockWidth + gap);
+        colorInputBox.setY(top + 4);
+        colorInputBox.setWidth(colorWidth);
+
+        int commitY = top + (SETTING_ROW_HEIGHT - LIST_ICON_SIZE) / 2;
+        graphics.fill(commitX, commitY, commitX + LIST_ICON_SIZE, commitY + LIST_ICON_SIZE, accent());
+        drawPlus(graphics, commitX, commitY, TEXT_ON_ACCENT);
+    }
+
+    /** Draws a small plus icon centered in a {@link #LIST_ICON_SIZE} square. */
+    private static void drawPlus(GuiGraphicsExtractor graphics, int x, int y, int color) {
+        int cx = x + LIST_ICON_SIZE / 2;
+        int cy = y + LIST_ICON_SIZE / 2;
+        graphics.fill(cx - 3, cy - 1, cx + 3, cy + 1, color);
+        graphics.fill(cx - 1, cy - 3, cx + 1, cy + 3, color);
+    }
+
+    /** Formats a slider value, trimming trailing zeros, e.g. 1.500 -> "1.5". */
+    private static String trimDouble(double value) {
+        return String.format("%.3f", value).replaceAll("0+$", "").replaceAll("\\.$", "");
+    }
+
+    /** Routes clicks: tabs switch the category, rows toggle (left) or expand (right), settings handle themselves. */
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        double mouseX = event.x();
+        double mouseY = event.y();
+        int button = event.button();
+
+        // While recording a keybind combo, clicks only switch to another keybind
+        // row; everything else is swallowed so no module gets toggled mid-capture.
+        if (capturingKeybind != null) {
+            if (button == InputConstants.MOUSE_BUTTON_LEFT) {
+                KeybindSetting target = findKeybindRowAt(mouseX, mouseY);
+                if (target != null) {
+                    startKeybindCapture(target);
+                }
+            }
+            return true;
+        }
+
+        if (button == InputConstants.MOUSE_BUTTON_LEFT) {
+            int buttonTop = panelY + TITLE_HEIGHT;
+            int buttonBottom = buttonTop + TAB_HEIGHT - 2;
+            int buttonLeft = panelX + PADDING;
+            int buttonRight = panelX + panelWidth - PADDING;
+
+            if (categoryDropdownOpen) {
+                int popupTop = buttonBottom + 2;
+                List<Category> categories = visibleCategories();
+                for (int i = 0; i <= categories.size(); i++) {
+                    int optionTop = popupTop + i * DROPDOWN_OPTION_HEIGHT;
+                    int optionBottom = optionTop + DROPDOWN_OPTION_HEIGHT;
+                    if (mouseX >= buttonLeft && mouseX < buttonRight
+                            && mouseY >= optionTop && mouseY < optionBottom) {
+                        selectedCategory = i == 0 ? null : categories.get(i - 1);
+                        scrollOffset = 0;
+                        clearListEditing();
+                        categoryDropdownOpen = false;
+                        return true;
+                    }
+                }
+                // Click the button again to close, or anywhere else to dismiss
+                // without toggling whatever module row sits underneath.
+                categoryDropdownOpen = false;
+                return true;
+            } else if (mouseY >= buttonTop && mouseY < buttonBottom
+                    && mouseX >= buttonLeft && mouseX < buttonRight) {
+                categoryDropdownOpen = true;
+                return true;
+            }
+        }
+
+        if (super.mouseClicked(event, doubleClick)) {
+            return true;
+        }
+
+        // Clicking anywhere outside the open string editor commits its text.
+        if (stringEditing != null && stringInputBox != null) {
+            boolean insideBox = mouseX >= stringInputBox.getX() - 2 && mouseX < stringInputBox.getX() + stringInputBox.getWidth() + 2
+                    && mouseY >= stringInputBox.getY() - 2 && mouseY < stringInputBox.getY() + stringInputBox.getHeight() + 2;
+            if (!insideBox) {
+                closeStringEditing(true);
+            }
+        }
+
+        int listTop = panelY + headerHeight();
+        List<RowLayout> layout = computeLayout(listTop);
+        int scroll = (int) scrollOffset;
+
+        for (RowLayout row : layout) {
+            int top = row.top - scroll;
+
+            if (mouseY >= top && mouseY < top + ROW_HEIGHT
+                    && mouseX >= panelX + PADDING && mouseX <= panelX + panelWidth - PADDING) {
+                if (button == InputConstants.MOUSE_BUTTON_LEFT) {
+                    row.module.toggle();
+                } else if (button == InputConstants.MOUSE_BUTTON_RIGHT) {
+                    expandedModule = (expandedModule == row.module) ? null : row.module;
+                }
+                clearListEditing();
+                return true;
+            }
+
+            if (row.expanded) {
+                int settingTop = top + ROW_HEIGHT + 2;
+                for (SettingRowLayout settingRow : row.settingRows) {
+                    if (mouseY >= settingTop && mouseY < settingTop + settingRow.height()) {
+                        handleSettingClick(settingRow, mouseX, mouseY, settingTop);
+                        return true;
+                    }
+                    settingTop += settingRow.height();
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /** Dispatches a click on a setting row to the appropriate interaction (toggle/cycle/drag/list). */
+    private void handleSettingClick(SettingRowLayout settingRow, double mouseX, double mouseY, int settingTop) {
+        if (settingRow.setting instanceof BooleanSetting boolSetting) {
+            boolSetting.toggle();
+        } else if (settingRow.setting instanceof NumberSetting numberSetting) {
+            draggingSetting = numberSetting;
+            updateSliderFromMouse(numberSetting, mouseX);
+        } else if (settingRow.setting instanceof EnumSetting<?> enumSetting) {
+            enumSetting.cycle();
+        } else if (settingRow.setting instanceof KeybindSetting keybindSetting) {
+            startKeybindCapture(keybindSetting);
+        } else if (settingRow.setting instanceof ListSetting listSetting) {
+            handleListSettingClick(listSetting, mouseX, mouseY, settingTop);
+        } else if (settingRow.setting instanceof StringSetting stringSetting) {
+            startStringEditing(stringSetting);
+        } else if (settingRow.setting instanceof ClickableSetting clickableSetting) {
+            clickableSetting.onClick(mouseX, mouseY);
+        }
+    }
+
+    /** Handles clicks within a list setting: add icon, per-entry remove icons, or the commit icon. */
+    private void handleListSettingClick(ListSetting setting, double mouseX, double mouseY, int top) {
+        int left = panelX + PADDING + 8;
+        int right = panelX + panelWidth - PADDING - 8;
+
+        if (mouseY < top + SETTING_ROW_HEIGHT) {
+            int addX = right - LIST_ICON_SIZE;
+            int addY = top + (SETTING_ROW_HEIGHT - LIST_ICON_SIZE) / 2;
+            if (mouseX >= addX && mouseX < addX + LIST_ICON_SIZE
+                    && mouseY >= addY && mouseY < addY + LIST_ICON_SIZE) {
+                startAddingEntry(setting);
+            }
+            return;
+        }
+
+        int entryTop = top + SETTING_ROW_HEIGHT;
+        int entryIndex = (int) ((mouseY - entryTop) / SETTING_ROW_HEIGHT);
+        if (entryIndex >= 0 && entryIndex < setting.get().size()) {
+            int rowTop = entryTop + entryIndex * SETTING_ROW_HEIGHT;
+            int removeX = right - LIST_ICON_SIZE;
+            int removeY = rowTop + (SETTING_ROW_HEIGHT - LIST_ICON_SIZE) / 2;
+            if (mouseX >= removeX && mouseX < removeX + LIST_ICON_SIZE
+                    && mouseY >= removeY && mouseY < removeY + LIST_ICON_SIZE) {
+                setting.remove(entryIndex);
+            }
+            return;
+        }
+
+        if (listEditing == setting) {
+            int inputTop = top + SETTING_ROW_HEIGHT * (1 + setting.get().size());
+            int commitX = right - LIST_ICON_SIZE;
+            int commitY = inputTop + (SETTING_ROW_HEIGHT - LIST_ICON_SIZE) / 2;
+            if (mouseX >= commitX && mouseX < commitX + LIST_ICON_SIZE
+                    && mouseY >= commitY && mouseY < commitY + LIST_ICON_SIZE) {
+                commitNewEntry();
+            }
+        }
+    }
+
+    /** Opens the inline inputs for appending an entry to the given list setting. */
+    private void startAddingEntry(ListSetting setting) {
+        cancelListEditing();
+        listEditing = setting;
+        blockInputBox = new EditBox(this.font, 0, 0, 90, 12, Component.literal("Block id"));
+        blockInputBox.setHint(Component.literal("block id"));
+        blockInputBox.setBordered(false);
+        blockInputBox.setMaxLength(64);
+        colorInputBox = new EditBox(this.font, 0, 0, 60, 12, Component.literal("Color"));
+        colorInputBox.setHint(Component.literal("#rrggbb"));
+        colorInputBox.setBordered(false);
+        colorInputBox.setMaxLength(9);
+        addRenderableWidget(blockInputBox);
+        addRenderableWidget(colorInputBox);
+        blockInputBox.setFocused(true);
+        setFocused(blockInputBox);
+    }
+
+    /** Reads the inline inputs and appends the entry (skipped when the block id is blank). */
+    private void commitNewEntry() {
+        if (listEditing != null) {
+            String blockName = blockInputBox != null ? blockInputBox.getValue().trim() : "";
+            String color = colorInputBox != null ? colorInputBox.getValue().trim() : "";
+            if (!blockName.isEmpty()) {
+                listEditing.add(blockName, color.isEmpty() ? "#FFFFFF" : color);
+            }
+        }
+        cancelListEditing();
+    }
+
+    /** Tears down the list-editing inputs and clears focus. */
+    private void cancelListEditing() {
+        if (blockInputBox != null) {
+            if (getFocused() == blockInputBox || getFocused() == colorInputBox) {
+                setFocused(null);
+            }
+            removeWidget(blockInputBox);
+            removeWidget(colorInputBox);
+        }
+        blockInputBox = null;
+        colorInputBox = null;
+        listEditing = null;
+    }
+
+    /** Cancels list editing if a list is currently being edited. */
+    private void clearListEditing() {
+        if (listEditing != null) {
+            cancelListEditing();
+        }
+    }
+
+    /** Opens the inline text input for editing a string setting's value. */
+    private void startStringEditing(StringSetting setting) {
+        clearListEditing();
+        if (stringEditing == setting) {
+            return;
+        }
+        closeStringEditing(true);
+        stringEditing = setting;
+        stringInputBox = new EditBox(this.font, 0, 0, 100, 12, Component.literal(setting.getName()));
+        stringInputBox.setBordered(false);
+        stringInputBox.setMaxLength(64);
+        stringInputBox.setValue(setting.get());
+        stringInputBox.setCursorPosition(stringInputBox.getValue().length());
+        addRenderableWidget(stringInputBox);
+        stringInputBox.setFocused(true);
+        setFocused(stringInputBox);
+    }
+
+    /** Writes the editor's text into the setting (when committing) and tears the editor down. */
+    private void closeStringEditing(boolean commit) {
+        if (stringEditing == null) {
+            return;
+        }
+        if (commit && stringInputBox != null) {
+            stringEditing.set(stringInputBox.getValue().trim());
+        }
+        if (stringInputBox != null) {
+            if (getFocused() == stringInputBox) {
+                setFocused(null);
+            }
+            removeWidget(stringInputBox);
+        }
+        stringInputBox = null;
+        stringEditing = null;
+    }
+
+    /** Whether a keybind combo is currently being recorded (used by {@link KeybindManager} to suppress input). */
+    public boolean isCapturingKeybind() {
+        return capturingKeybind != null;
+    }
+
+    /** Enters combo-recording mode for the given keybind setting. */
+    private void startKeybindCapture(KeybindSetting setting) {
+        clearListEditing();
+        closeStringEditing(true);
+        draggingSetting = null;
+        capturingKeybind = setting;
+        captureBuffer.clear();
+        currentlyHeld.clear();
+    }
+
+    /** Exits combo-recording mode without saving, discarding the buffer. */
+    private void cancelKeybindCapture() {
+        capturingKeybind = null;
+        captureBuffer.clear();
+        currentlyHeld.clear();
+    }
+
+    /** Assigns the recorded combo to its setting and exits recording mode. */
+    private void commitKeybindCapture() {
+        if (capturingKeybind != null) {
+            capturingKeybind.set(Keybind.of(new ArrayList<>(captureBuffer)));
+        }
+        cancelKeybindCapture();
+    }
+
+    /** The combo text shown while recording: "Press keys..." or the keys held so far. */
+    private String captureLabel() {
+        if (captureBuffer.isEmpty()) return "Press keys...";
+        StringBuilder builder = new StringBuilder();
+        for (int key : captureBuffer) {
+            if (!builder.isEmpty()) builder.append(" + ");
+            builder.append(GlfwKeyNames.label(key));
+        }
+        return builder.toString();
+    }
+
+    /** Finds the expanded keybind setting row under the mouse, if any. */
+    private KeybindSetting findKeybindRowAt(double mouseX, double mouseY) {
+        if (mouseX < panelX + PADDING || mouseX > panelX + panelWidth - PADDING) return null;
+        int listTop = panelY + headerHeight();
+        List<RowLayout> layout = computeLayout(listTop);
+        int scroll = (int) scrollOffset;
+        for (RowLayout row : layout) {
+            if (!row.expanded) continue;
+            int top = row.top - scroll;
+            int settingTop = top + ROW_HEIGHT + 2;
+            for (SettingRowLayout settingRow : row.settingRows) {
+                if (mouseY >= settingTop && mouseY < settingTop + settingRow.height()
+                        && settingRow.setting() instanceof KeybindSetting keybindSetting) {
+                    return keybindSetting;
+                }
+                settingTop += settingRow.height();
+            }
+        }
+        return null;
+    }
+
+    /** Enter/confirm commits the in-progress list entry instead of toggling focus. */
+    @Override
+    public boolean keyPressed(KeyEvent event) {
+        if (capturingKeybind != null) {
+            int key = event.key();
+            if (key == InputConstants.KEY_ESCAPE) {
+                cancelKeybindCapture();
+                return true;
+            }
+            currentlyHeld.add(key);
+            if (captureBuffer.size() < Keybind.MAX_KEYS) {
+                captureBuffer.add(key);
+            }
+            return true;
+        }
+        if (event.isConfirmation() && listEditing != null) {
+            commitNewEntry();
+            return true;
+        }
+        if (stringEditing != null) {
+            if (event.isConfirmation()) {
+                closeStringEditing(true);
+            } else if (event.key() == InputConstants.KEY_ESCAPE) {
+                closeStringEditing(false);
+            } else {
+                return super.keyPressed(event);
+            }
+            return true;
+        }
+        return super.keyPressed(event);
+    }
+
+    /** While recording, swallows character input so it never reaches the focused search box. */
+    @Override
+    public boolean charTyped(CharacterEvent event) {
+        if (capturingKeybind != null) {
+            return true;
+        }
+        return super.charTyped(event);
+    }
+
+    /** While recording, commits the combo once every recorded key has been released. */
+    @Override
+    public boolean keyReleased(KeyEvent event) {
+        if (capturingKeybind != null) {
+            currentlyHeld.remove(event.key());
+            if (currentlyHeld.isEmpty() && !captureBuffer.isEmpty()) {
+                commitKeybindCapture();
+            }
+            return true;
+        }
+        return super.keyReleased(event);
+    }
+
+    /** While dragging with the left button held, moves the active number slider with the mouse. */
+    @Override
+    public boolean mouseDragged(MouseButtonEvent event, double dragX, double dragY) {
+        double mouseX = event.x();
+        int button = event.button();
+        if (button == InputConstants.MOUSE_BUTTON_LEFT && draggingSetting != null) {
+            updateSliderFromMouse(draggingSetting, mouseX);
+            return true;
+        }
+        return super.mouseDragged(event, dragX, dragY);
+    }
+
+    /** Ends a slider drag when the left button is released. */
+    @Override
+    public boolean mouseReleased(MouseButtonEvent event) {
+        int button = event.button();
+        if (button == InputConstants.MOUSE_BUTTON_LEFT && draggingSetting != null) {
+            draggingSetting = null;
+            return true;
+        }
+        return super.mouseReleased(event);
+    }
+
+    /** Maps the mouse X within the slider track to the setting's 0-1 progress. */
+    private void updateSliderFromMouse(NumberSetting setting, double mouseX) {
+        int left = panelX + PADDING + 8;
+        int right = panelX + panelWidth - PADDING - 8;
+        double progress = (mouseX - left) / (double) (right - left);
+        setting.setFromProgress(progress);
+    }
+
+    /** Scrolls the module list by the wheel delta. */
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        scrollOffset -= scrollY * ROW_HEIGHT;
+        return true;
+    }
+
+    /** Builds the visible row layout, filtering by category and search query and expanding settings. */
+    private List<RowLayout> computeLayout(int listTop) {
+        List<RowLayout> layout = new ArrayList<>();
+        String query = searchQuery.toLowerCase();
+        int cursor = listTop;
+
+        for (Module module : ModuleManager.getVisibleModules()) {
+            if (!HiddenModules.isVisible(module)) continue;
+            if (selectedCategory != null && module.getCategory() != selectedCategory) {
+                continue;
+            }
+            if (!query.isBlank() && !module.getName().toLowerCase().contains(query)
+                    && !module.getCategory().getDisplayName().toLowerCase().contains(query)) {
+                continue;
+            }
+
+            boolean expanded = module == expandedModule && !module.getSettings().isEmpty();
+            List<SettingRowLayout> settingRows = new ArrayList<>();
+            if (expanded) {
+                for (Setting<?> setting : module.getSettings()) {
+                    settingRows.add(new SettingRowLayout(setting, settingHeight(setting)));
+                }
+            }
+
+            int height = ROW_HEIGHT + (expanded ? settingRows.stream().mapToInt(SettingRowLayout::height).sum() + 2 : 0);
+            layout.add(new RowLayout(module, cursor, height, expanded, settingRows));
+            cursor += height;
+        }
+
+        return layout;
+    }
+
+    /** The rendered height of a setting row; list settings grow with their entries, string settings gain an input row while editing. */
+    private int settingHeight(Setting<?> setting) {
+        if (setting instanceof ListSetting listSetting) {
+            return SETTING_ROW_HEIGHT * (1 + listSetting.get().size() + (listEditing == listSetting ? 1 : 0));
+        }
+        if (setting instanceof StringSetting stringSetting) {
+            return SETTING_ROW_HEIGHT * (stringEditing == stringSetting ? 2 : 1);
+        }
+        return SETTING_ROW_HEIGHT;
+    }
+
+    private record SettingRowLayout(Setting<?> setting, int height) {
+    }
+
+    private record RowLayout(Module module, int top, int height, boolean expanded, List<SettingRowLayout> settingRows) {
+        int bottom() {
+            return top + height;
+        }
+    }
+}

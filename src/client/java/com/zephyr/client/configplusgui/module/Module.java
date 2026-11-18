@@ -1,0 +1,167 @@
+package com.zephyr.client.configplusgui.module;
+
+import com.zephyr.client.api.ZephyrEvents;
+import com.zephyr.client.configplusgui.setting.Setting;
+import net.minecraft.client.Minecraft;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Base class for every addon feature.
+ *
+ * <p>Extend this, create a singleton instance, and register it with
+ * {@link com.zephyr.client.api.ZephyrApi#registerModule(Module)}. The module then
+ * appears in the click-gui, persists to {@code modules.json}, receives ticks while
+ * enabled, and gets a keybind slot.
+ *
+ * <p>Example:
+ * <pre>{@code
+ * public final class AutoGreet extends Module {
+ *     public static final AutoGreet INSTANCE = new AutoGreet();
+ *     private final BooleanSetting greet = new BooleanSetting("Greet", true);
+ *     private AutoGreet() {
+ *         super("Auto Greet", "Greets players on join", ZephyrApi.registerCategory("MyAddon"));
+ *         addSetting(greet);
+ *     }
+ *     @Override protected void onEnable() { }
+ *     @Override protected void onDisable() { }
+ *     @Override public void tick(Minecraft client) { }
+ * }
+ * }</pre>
+ *
+ * <p>Lifecycle: {@link #onEnable()} and {@link #onDisable()} fire on transitions;
+ * {@link #tick(Minecraft)} runs every client tick while enabled.
+ */
+public abstract class Module {
+    private final String name;
+    private final String description;
+    private final Category category;
+    private final boolean hidden;
+    private final boolean grimDetectable;
+    private final List<Setting<?>> settings = new ArrayList<>();
+
+    private boolean enabled;
+
+    /** Creates a module that starts disabled. */
+    protected Module(String name, String description, Category category) {
+        this(name, description, category, false, false, false);
+    }
+
+    /** Creates a module with an explicit initial enabled state (e.g. for always-on features). */
+    protected Module(String name, String description, Category category, boolean enabledByDefault) {
+        this(name, description, category, enabledByDefault, false, false);
+    }
+
+    /** Creates a module with hidden flag (hidden modules only shown when {@link HiddenModules#shouldShowHidden()} is true). */
+    protected Module(String name, String description, Category category, boolean enabledByDefault, boolean hidden) {
+        this(name, description, category, enabledByDefault, hidden, false);
+    }
+
+    /**
+     * Creates a module with both hidden and Grim-detectable flags.
+     * Grim-detectable modules are force-disabled and filtered from UI lists while
+     * {@code Hide Detectable Modules} is active (see GrimHidingManager). Unlike
+     * {@link #hidden} modules (permanent, UUID-gated, listed on the secret screen),
+     * Grim-hiding is a reversible global panic-style toggle that snapshots and
+     * restores state so profiles are never overwritten.
+     */
+    protected Module(String name, String description, Category category, boolean enabledByDefault, boolean hidden, boolean grimDetectable) {
+        this.name = name;
+        this.description = description;
+        this.category = category;
+        this.enabled = enabledByDefault;
+        this.hidden = hidden;
+        this.grimDetectable = grimDetectable;
+    }
+
+    /**
+     * Call from a subclass constructor to expose a setting in the click-gui's
+     * right-click customization panel.
+     */
+    protected final void addSetting(Setting<?> setting) {
+        settings.add(setting);
+    }
+
+    /** The module's unique display name, also used as the config/profile key. */
+    public final String getName() {
+        return name;
+    }
+
+    /** Short description shown in the click-gui. */
+    public final String getDescription() {
+        return description;
+    }
+
+    /** The tab this module appears under in the click-gui. */
+    public final Category getCategory() {
+        return category;
+    }
+
+    /** Whether this module is hidden and only shown when {@link HiddenModules#shouldShowHidden()} is true. */
+    public final boolean isHidden() {
+        return hidden;
+    }
+
+    /**
+     * Whether Grim anticheat can detect this module's behavior (movement prediction,
+     * combat/aim/rotation, scaffolding, elytra, velocity, badpackets, etc.).
+     * While {@code Hide Detectable Modules} is active these modules are
+     * force-disabled and filtered from UI lists (see GrimHidingManager).
+     */
+    public final boolean isGrimDetectable() {
+        return grimDetectable;
+    }
+
+    /** The module's exposed settings, read-only; populated via {@link #addSetting}. */
+    public final List<Setting<?>> getSettings() {
+        return Collections.unmodifiableList(settings);
+    }
+
+    /** Whether the module is currently enabled. */
+    public final boolean isEnabled() {
+        return enabled;
+    }
+
+    /**
+     * Enables or disables the module, firing {@link #onEnable()} / {@link #onDisable()}
+     * on the transition. No-ops when the state is unchanged.
+     */
+    public final void setEnabled(boolean enabled) {
+        if (this.enabled == enabled) return;
+        this.enabled = enabled;
+        if (enabled) {
+            onEnable();
+        } else {
+            onDisable();
+        }
+        ZephyrEvents.fireModuleToggled(this, enabled);
+    }
+
+    /**
+     * Sets the enabled flag without firing {@link #onEnable()}/{@link #onDisable()}.
+     * Used by the config loader on startup, before the game is necessarily ready
+     * for a module's enable-side-effects to run.
+     */
+    public final void setEnabledSilently(boolean enabled) {
+        this.enabled = enabled;
+    }
+
+    /** Flips the module between enabled and disabled. */
+    public final void toggle() {
+        setEnabled(!enabled);
+    }
+
+    /** Called once when the module transitions from disabled to enabled. */
+    protected void onEnable() {
+    }
+
+    /** Called once when the module transitions from enabled to disabled. */
+    protected void onDisable() {
+    }
+
+    /** Called every client tick while this module is enabled. */
+    public void tick(Minecraft client) {
+    }
+}

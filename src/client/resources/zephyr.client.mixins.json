@@ -1,0 +1,16 @@
+{
+	"required": true,
+	"package": "com.zephyr.client.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"commands.ChatInterceptMixin",
+		"commands.CommandSuggestionsAccessor",
+		"commands.CommandSuggestionsMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
